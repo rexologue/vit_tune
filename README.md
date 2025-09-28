@@ -87,6 +87,29 @@ During training the script writes the following to `out.output_dir`:
 
 Console output mirrors epoch metrics and prints the final test-set summary.
 
+### 5. Publish the model to the Hugging Face Hub
+
+After training, use `src/utils/push_to_hf.py` to bundle the best checkpoint and
+`labels.json` into a Hub repository:
+
+```bash
+python -m src.utils.push_to_hf \
+  --model-name vit_base_patch16_224 \
+  --checkpoint out/checkpoints/best.pt \
+  --labels out/labels.json \
+  --repo-id your-username/your-model \
+  --token hf_your_token_here
+```
+
+The helper:
+
+- Re-creates the TIMM architecture to validate the checkpoint.
+- Uploads a `pytorch_model.bin`, `config.json`, `labels.json`, and README to the Hub.
+- Can target private repositories (`--private`) or update an existing repo (`--allow-existing`).
+
+Provide the drop-path rate used during training via `--drop-path-rate` if it was
+enabled in your configuration.
+
 ## Development tips
 
 - Enable deterministic behaviour by leaving `out.seed` at a fixed value. The script seeds Python, NumPy (via scikit-learn), and PyTorch.
@@ -113,7 +136,7 @@ Console output mirrors epoch metrics and prints the final test-set summary.
 │   ├── loggers/            # Optional Neptune logger wrapper
 │   ├── models/             # TIMM model builder
 │   ├── transforms.py       # Image augmentations for train/validation
-│   └── utils/              # Configuration loading and reproducibility helpers
+│   └── utils/              # Configuration helpers and the Hugging Face uploader
 └── config.example.yaml     # Reference configuration with documented defaults
 ```
 
