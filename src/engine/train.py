@@ -21,7 +21,7 @@ def accuracy(output, target, topk=(1,)):
         res = []
         for k in topk:
             correct_k = correct[:k].reshape(-1).float().sum(0, keepdim=True)
-            res.append(correct_k.mul_(100.0 / batch_size))
+            res.append(correct_k.mul_(1.0 / batch_size))
         return res
 
 
@@ -207,12 +207,18 @@ def _save_checkpoint(path: Path, model, optimizer, epoch: int, monitor_name: str
     torch.save(payload, path)
 
 
-def _log_confusion_matrix(neptune_run, namespace: str, matrix: np.ndarray, class_names: Sequence[str], step: Optional[int] = None):
-    if neptune_run is None:
+def _log_confusion_matrix(neptune_logger, namespace: str, matrix: np.ndarray, class_names: Sequence[str], step: Optional[int] = None):
+    if neptune_logger is None:
         return
     matrix_list = matrix.tolist()
     payload = {"epoch": step, "matrix": matrix_list, "labels": list(class_names)}
-    neptune_run[f"{namespace}/confusion_matrix/data"].append(payload)
+    try:
+        from neptune.utils import stringify_unsupported
+
+        safe_payload = stringify_unsupported(payload)
+    except Exception:
+        safe_payload = payload
+    neptune_logger.run[f"{namespace}/confusion_matrix/data"].append(safe_payload)
     try:
         import matplotlib
 
@@ -246,7 +252,7 @@ def _log_confusion_matrix(neptune_run, namespace: str, matrix: np.ndarray, class
                 color="white" if matrix[i, j] > thresh else "black",
             )
     fig.tight_layout()
-    neptune_run[f"{namespace}/confusion_matrix/plot"].append(File.as_image(fig), step=step)
+    neptune_logger.save_plot(namespace, "confusion_matrix", File.as_image(fig))
     plt.close(fig)
 
 
@@ -260,7 +266,7 @@ def run_training(
     out_dir: str,
     num_classes: int,
     class_names: Sequence[str],
-    neptune_run=None,
+    neptune_logger=None,
 ):
     scaler = create_grad_scaler(device, enabled=bool(cfg["train"].get("amp", True)))
     epochs = int(cfg["train"]["epochs"])
@@ -276,10 +282,10 @@ def run_training(
         raise ValueError("Checkpoint mode must be 'max' or 'min'")
     best_metric = float("-inf") if mode == "max" else float("inf")
     best_epoch: Optional[int] = None
-    if neptune_run is not None:
-        neptune_run["checkpoints/dir"] = str(ckpt_dir)
-        neptune_run["checkpoints/monitor"] = monitor
-        neptune_run["checkpoints/mode"] = mode
+    if neptune_logger is not None:
+        neptune_logger.run["checkpoints/dir"] = str(ckpt_dir)
+        neptune_logger.run["checkpoints/monitor"] = monitor
+        neptune_logger.run["checkpoints/mode"] = mode
 
     for epoch in range(1, epochs + 1):
         tr = train_one_epoch(model, loaders["train"], optimizer, scaler, device, criterion, cfg)
@@ -312,23 +318,34 @@ def run_training(
             best_epoch = epoch
             best_path = ckpt_dir / "best.pt"
             _save_checkpoint(best_path, model, optimizer, epoch, monitor, current_metric)
-            if neptune_run is not None:
-                neptune_run["checkpoints/best_epoch"] = epoch
-                neptune_run["checkpoints/best_metric"] = float(best_metric)
+            if neptune_logger is not None:
+                neptune_logger.run["checkpoints/best_epoch"] = epoch
+                neptune_logger.run["checkpoints/best_metric"] = float(best_metric)
 
         if save_every > 0 and epoch % save_every == 0:
             epoch_path = ckpt_dir / f"epoch_{epoch}.pt"
             _save_checkpoint(epoch_path, model, optimizer, epoch, monitor, float(current_metric))
 
-        if neptune_run is not None:
-            neptune_run["metrics/train/loss"].append(tr["loss"], step=epoch)
-            neptune_run["metrics/train/acc1"].append(tr["acc1"], step=epoch)
-            neptune_run["metrics/train/f1_weighted"].append(tr["f1_weighted"], step=epoch)
-            neptune_run["metrics/val/loss"].append(va["loss"], step=epoch)
-            neptune_run["metrics/val/acc1"].append(va["acc1"], step=epoch)
-            neptune_run["metrics/val/f1_weighted"].append(va["f1_weighted"], step=epoch)
-            neptune_run["metrics/lr"].append(optimizer.param_groups[0]["lr"], step=epoch)
-            _log_confusion_matrix(neptune_run, "val", va["confusion_matrix"], class_names, step=epoch)
+        if neptune_logger is not None:
+            neptune_logger.save_metrics(
+                "metrics/train",
+                ["loss", "acc1", "f1_weighted"],
+                [tr["loss"], tr["acc1"], tr["f1_weighted"]],
+                step=epoch,
+            )
+            neptune_logger.save_metrics(
+                "metrics/val",
+                ["loss", "acc1", "f1_weighted"],
+                [va["loss"], va["acc1"], va["f1_weighted"]],
+                step=epoch,
+            )
+            neptune_logger.save_metrics(
+                "metrics",
+                "lr",
+                optimizer.param_groups[0]["lr"],
+                step=epoch,
+            )
+            _log_confusion_matrix(neptune_logger, "val", va["confusion_matrix"], class_names, step=epoch)
 
     history_path = Path(out_dir) / "history.json"
     with open(history_path, "w", encoding="utf-8") as f:
@@ -345,13 +362,15 @@ def run_training(
     with open(Path(out_dir) / "test_metrics.json", "w", encoding="utf-8") as f:
         json.dump(test_metrics, f, ensure_ascii=False, indent=2)
 
-    if neptune_run is not None:
-        neptune_run["metrics/test/loss"] = te["loss"]
-        neptune_run["metrics/test/acc1"] = te["acc1"]
-        neptune_run["metrics/test/f1_weighted"] = te["f1_weighted"]
-        _log_confusion_matrix(neptune_run, "test", te["confusion_matrix"], class_names, step=None)
+    if neptune_logger is not None:
+        neptune_logger.save_metrics(
+            "metrics/test",
+            ["loss", "acc1", "f1_weighted"],
+            [te["loss"], te["acc1"], te["f1_weighted"]],
+        )
+        _log_confusion_matrix(neptune_logger, "test", te["confusion_matrix"], class_names, step=None)
         if best_epoch is not None:
-            neptune_run["checkpoints/best_metric"] = float(best_metric)
-            neptune_run["checkpoints/best_epoch"] = int(best_epoch)
+            neptune_logger.run["checkpoints/best_metric"] = float(best_metric)
+            neptune_logger.run["checkpoints/best_epoch"] = int(best_epoch)
 
     return history
