@@ -4,6 +4,7 @@ from pathlib import Path
 from collections import Counter
 from copy import deepcopy
 from typing import Any, Dict, Optional
+from types import SimpleNamespace
 
 import torch
 from torch.utils.data import DataLoader
@@ -19,49 +20,47 @@ from src.models.build import build_model
 from src.engine.train import run_training, build_criterion
 
 
-def _init_neptune_run(cfg: Dict[str, Any]):
+def _init_neptune_logger(cfg: Dict[str, Any]):
     neptune_cfg = cfg.get("neptune", {})
     if not neptune_cfg.get("enabled", False):
         return None
-    try:
-        import neptune
-    except ImportError as exc:  # pragma: no cover - optional dependency
-        raise RuntimeError(
-            "Neptune logging requested but neptune package is not installed"
-        ) from exc
-    try:  # pragma: no cover - optional dependency
-        from neptune.utils import stringify_unsupported  # type: ignore
-    except Exception:  # pragma: no cover - fallback if helper unavailable
-        def stringify_unsupported(value: Any):  # type: ignore
-            if isinstance(value, dict):
-                return {k: stringify_unsupported(v) for k, v in value.items()}
-            if isinstance(value, (list, tuple, set)):
-                serialized_items = [stringify_unsupported(v) for v in value]
-                return json.dumps(serialized_items, ensure_ascii=False)
-            if isinstance(value, (str, int, float, bool)) or value is None:
-                return value
-            return str(value)
 
     project = neptune_cfg.get("project")
     if not project:
         raise ValueError("Neptune project must be provided when logging is enabled")
-    api_token = neptune_cfg.get("api_token") or os.environ.get("NEPTUNE_API_TOKEN")
-    run = neptune.init_run(
+
+    try:
+        from src.loggers.neptune_logger import NeptuneLogger
+    except ImportError as exc:  # pragma: no cover - optional dependency
+        raise RuntimeError(
+            "Neptune logging requested but neptune package is not installed"
+        ) from exc
+
+    logger_config = SimpleNamespace(
         project=project,
-        api_token=api_token,
+        experiment_name=neptune_cfg.get("name"),
+        dependencies_path=neptune_cfg.get("dependencies_path"),
+        run_id=neptune_cfg.get("run_id"),
+        env_path=neptune_cfg.get("env_path"),
         tags=neptune_cfg.get("tags"),
-        name=neptune_cfg.get("name"),
+        api_token=neptune_cfg.get("api_token"),
     )
+
+    try:
+        from neptune.utils import stringify_unsupported
+    except ImportError as exc:  # pragma: no cover - optional dependency
+        raise RuntimeError(
+            "Neptune logging requested but neptune package is not installed"
+        ) from exc
+
+    logger = NeptuneLogger(logger_config)
     cfg_to_log = deepcopy(cfg)
     if "neptune" in cfg_to_log and "api_token" in cfg_to_log["neptune"]:
         cfg_to_log["neptune"]["api_token"] = "***"
     config_json = json.dumps(cfg_to_log, ensure_ascii=False, indent=2)
-    run["config/json"] = config_json
-    try:
-        run["config"] = stringify_unsupported(cfg_to_log)
-    except Exception:  # pragma: no cover - best effort fallback
-        run["config"] = config_json
-    return run
+    logger.run["config/json"] = config_json
+    logger.run["config"] = stringify_unsupported(cfg_to_log)
+    return logger
 
 
 def _prepare_model_cache(models_dir: Optional[str]):
@@ -100,7 +99,7 @@ def main(cfg_path: str, override_device: Optional[str] = None):
     out_dir = Path(cfg["out"]["output_dir"])
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    neptune_run = _init_neptune_run(cfg)
+    neptune_logger = _init_neptune_logger(cfg)
     _prepare_model_cache(cfg.get("model", {}).get("models_dir"))
 
     pairs = scan_folder(cfg["data"]["dataset_dir"])
@@ -114,17 +113,17 @@ def main(cfg_path: str, override_device: Optional[str] = None):
     class_stats_path = out_dir / "class_stats.json"
     with open(class_stats_path, "w", encoding="utf-8") as f:
         json.dump(class_counts_sorted, f, ensure_ascii=False, indent=2)
-    if neptune_run is not None:
-        neptune_run["dataset/class_counts"] = class_counts_sorted
-        neptune_run["dataset/num_classes"] = len(class_counts_sorted)
-        neptune_run["dataset/num_samples"] = sum(class_counts_sorted.values())
+    if neptune_logger is not None:
+        neptune_logger.run["dataset/class_counts"] = class_counts_sorted
+        neptune_logger.run["dataset/num_classes"] = len(class_counts_sorted)
+        neptune_logger.run["dataset/num_samples"] = sum(class_counts_sorted.values())
         dropped_counts = {
             label: count
             for label, count in sorted(original_counts.items(), key=lambda x: x[0])
             if label not in class_counts_sorted
         }
         if dropped_counts:
-            neptune_run["dataset/dropped_class_counts"] = dropped_counts
+            neptune_logger.run["dataset/dropped_class_counts"] = dropped_counts
 
     labels = sorted({label for _, label in train_pairs + val_pairs + test_pairs})
     label_to_idx = {label: i for i, label in enumerate(labels)}
@@ -162,8 +161,8 @@ def main(cfg_path: str, override_device: Optional[str] = None):
     else:
         weights = None
     device = _resolve_device(cfg, override=override_device)
-    if neptune_run is not None:
-        neptune_run["environment/device"] = str(device)
+    if neptune_logger is not None:
+        neptune_logger.run["environment/device"] = str(device)
     model = build_model(
         cfg["model"]["name"],
         num_classes=len(labels),
@@ -191,18 +190,18 @@ def main(cfg_path: str, override_device: Optional[str] = None):
             str(out_dir),
             num_classes=len(labels),
             class_names=[idx_to_label[i] for i in range(len(labels))],
-            neptune_run=neptune_run,
+            neptune_logger=neptune_logger,
         )
-        if neptune_run is not None:
-            neptune_run["status"] = "completed"
+        if neptune_logger is not None:
+            neptune_logger.run["status"] = "completed"
     except Exception as exc:
-        if neptune_run is not None:
-            neptune_run["status"] = "failed"
-            neptune_run["error/message"] = str(exc)
+        if neptune_logger is not None:
+            neptune_logger.run["status"] = "failed"
+            neptune_logger.run["error/message"] = str(exc)
         raise
     finally:
-        if neptune_run is not None:
-            neptune_run.stop()
+        if neptune_logger is not None:
+            neptune_logger.stop()
 
 
 if __name__ == "__main__":
