@@ -1,0 +1,29 @@
+data:
+  dataset_dir: "/path/to/images"
+  min_samples_per_class: 20
+  image_size: 448
+  split:
+    train: 0.8
+    val: 0.1
+    test: 0.1
+  num_workers: 8
+train:
+  epochs: 30
+  batch_size: 64
+  lr: 5.0e-5
+  weight_decay: 0.05
+  warmup_epochs: 3
+  amp: true
+  grad_clip_norm: 1.0
+model:
+  name: "vit_large_patch16_448"
+  pretrained: true
+  drop_path_rate: 0.1
+loss:
+  type: "cross_entropy"
+  class_weighting: "inv_freq"
+  focal_gamma: 2.0
+out:
+  output_dir: "./runs/vit_large"
+  save_every: 5
+  seed: 42
