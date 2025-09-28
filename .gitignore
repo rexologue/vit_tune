@@ -1427,3 +1427,4 @@ erl_crash.dump
 
 CMakeUserPresets.json
 config.yaml
+.neptune
