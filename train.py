@@ -29,6 +29,18 @@ def _init_neptune_run(cfg: Dict[str, Any]):
         raise RuntimeError(
             "Neptune logging requested but neptune package is not installed"
         ) from exc
+    try:  # pragma: no cover - optional dependency
+        from neptune.utils import stringify_unsupported  # type: ignore
+    except Exception:  # pragma: no cover - fallback if helper unavailable
+        def stringify_unsupported(value: Any):  # type: ignore
+            if isinstance(value, dict):
+                return {k: stringify_unsupported(v) for k, v in value.items()}
+            if isinstance(value, (list, tuple, set)):
+                serialized_items = [stringify_unsupported(v) for v in value]
+                return json.dumps(serialized_items, ensure_ascii=False)
+            if isinstance(value, (str, int, float, bool)) or value is None:
+                return value
+            return str(value)
 
     project = neptune_cfg.get("project")
     if not project:
@@ -43,7 +55,12 @@ def _init_neptune_run(cfg: Dict[str, Any]):
     cfg_to_log = deepcopy(cfg)
     if "neptune" in cfg_to_log and "api_token" in cfg_to_log["neptune"]:
         cfg_to_log["neptune"]["api_token"] = "***"
-    run["config"] = cfg_to_log
+    config_json = json.dumps(cfg_to_log, ensure_ascii=False, indent=2)
+    run["config/json"] = config_json
+    try:
+        run["config"] = stringify_unsupported(cfg_to_log)
+    except Exception:  # pragma: no cover - best effort fallback
+        run["config"] = config_json
     return run
 
 
@@ -57,7 +74,26 @@ def _prepare_model_cache(models_dir: Optional[str]):
     os.environ.setdefault("TIMM_CACHE_DIR", str(path))
 
 
-def main(cfg_path: str):
+def _resolve_device(cfg: Dict[str, Any], override: Optional[str] = None) -> torch.device:
+    device_str = override or cfg.get("train", {}).get("device")
+
+    if not device_str:
+        device_candidate = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    else:
+        try:
+            device_candidate = torch.device(device_str)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"Invalid device specification: {device_str}") from exc
+
+    if device_candidate.type == "cuda" and not torch.cuda.is_available():
+        raise RuntimeError(
+            "CUDA device requested but CUDA is not available on this system"
+        )
+
+    return device_candidate
+
+
+def main(cfg_path: str, override_device: Optional[str] = None):
     cfg = load_config(cfg_path)
     set_seed(int(cfg["out"].get("seed", 42)))
 
@@ -125,7 +161,9 @@ def main(cfg_path: str):
         weights = weights / weights.mean()
     else:
         weights = None
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = _resolve_device(cfg, override=override_device)
+    if neptune_run is not None:
+        neptune_run["environment/device"] = str(device)
     model = build_model(
         cfg["model"]["name"],
         num_classes=len(labels),
@@ -172,5 +210,13 @@ if __name__ == "__main__":
 
     ap = argparse.ArgumentParser()
     ap.add_argument("--config", "-c", required=True)
+    ap.add_argument(
+        "--device",
+        default=None,
+        help=(
+            "Device to use for training (e.g. 'cuda', 'cuda:1', or 'cpu'). "
+            "Overrides the value in the configuration file if provided."
+        ),
+    )
     args = ap.parse_args()
-    main(args.config)
+    main(args.config, override_device=args.device)

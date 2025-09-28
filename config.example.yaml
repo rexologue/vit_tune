@@ -15,6 +15,7 @@ train:
   warmup_epochs: 3
   amp: true
   grad_clip_norm: 1.0
+  device: null  # e.g. "cuda", "cuda:1", or "cpu"; null selects automatically
 model:
   name: "vit_large_patch16_448"
   pretrained: true
