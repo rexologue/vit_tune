@@ -43,7 +43,12 @@ def create_grad_scaler(device: torch.device, enabled: bool) -> "torch.amp.GradSc
     device_type = _resolve_device_type(device)
     amp_enabled = bool(enabled) and device_type.startswith("cuda")
     if hasattr(torch, "amp") and hasattr(torch.amp, "GradScaler"):
-        return torch.amp.GradScaler(device_type=device_type, enabled=amp_enabled)
+        grad_scaler_cls = torch.amp.GradScaler
+        try:
+            return grad_scaler_cls(device_type=device_type, enabled=amp_enabled)
+        except TypeError:
+            # Older PyTorch versions do not support the ``device_type`` argument.
+            return grad_scaler_cls(enabled=amp_enabled)
     from torch.cuda.amp import GradScaler as CudaGradScaler  # type: ignore[attr-defined]
 
     return CudaGradScaler(enabled=amp_enabled)
