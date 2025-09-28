@@ -1,11 +1,11 @@
 import json
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Dict, Optional, Sequence
 
 import numpy as np
 import torch
 from sklearn.metrics import f1_score, confusion_matrix
-from torch.cuda.amp import GradScaler, autocast
 from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
 
 from .losses import FocalLoss
@@ -33,20 +33,69 @@ def build_criterion(cfg, class_weights=None):
     return torch.nn.CrossEntropyLoss(weight=class_weights)
 
 
+def _resolve_device_type(device: torch.device) -> str:
+    if isinstance(device, torch.device):
+        return device.type
+    return torch.device(device).type
+
+
+def create_grad_scaler(device: torch.device, enabled: bool) -> "torch.amp.GradScaler":
+    device_type = _resolve_device_type(device)
+    amp_enabled = bool(enabled) and device_type.startswith("cuda")
+    if hasattr(torch, "amp") and hasattr(torch.amp, "GradScaler"):
+        return torch.amp.GradScaler(device_type=device_type, enabled=amp_enabled)
+    from torch.cuda.amp import GradScaler as CudaGradScaler  # type: ignore[attr-defined]
+
+    return CudaGradScaler(enabled=amp_enabled)
+
+
+@contextmanager
+def autocast_context(device: torch.device, enabled: bool):
+    if not enabled:
+        yield
+        return
+    device_type = _resolve_device_type(device)
+    if hasattr(torch, "amp") and hasattr(torch.amp, "autocast"):
+        with torch.amp.autocast(device_type=device_type, enabled=enabled):
+            yield
+        return
+    if device_type.startswith("cuda"):
+        from torch.cuda.amp import autocast as cuda_autocast  # type: ignore[attr-defined]
+
+        with cuda_autocast(enabled=enabled):
+            yield
+        return
+    yield
+
+
+def _resolve_monitor_value(metrics: Dict[str, float], monitor: str) -> float:
+    value = metrics.get(monitor)
+    if isinstance(value, (int, float)):
+        return float(value)
+    for prefix in ("train_", "val_", "test_"):
+        if monitor.startswith(prefix):
+            key = monitor[len(prefix) :]
+            value = metrics.get(key)
+            if isinstance(value, (int, float)):
+                return float(value)
+    available = sorted(k for k, v in metrics.items() if isinstance(v, (int, float)))
+    raise KeyError(f"Monitor '{monitor}' not found. Available metrics: {available}")
+
+
 def train_one_epoch(model, loader, optimizer, scaler, device, criterion, cfg):
     model.train()
     total_loss, total_acc, n = 0.0, 0.0, 0
-    amp = bool(cfg["train"].get("amp", True))
+    amp_enabled = scaler is not None and scaler.is_enabled()
     grad_clip = float(cfg["train"].get("grad_clip_norm", 0.0))
     all_preds, all_targets = [], []
     for images, targets in loader:
         images = images.to(device, non_blocking=True)
         targets = targets.to(device, non_blocking=True)
         optimizer.zero_grad(set_to_none=True)
-        if amp:
-            with autocast():
-                logits = model(images)
-                loss = criterion(logits, targets)
+        with autocast_context(device, enabled=amp_enabled):
+            logits = model(images)
+            loss = criterion(logits, targets)
+        if amp_enabled:
             scaler.scale(loss).backward()
             if grad_clip > 0:
                 scaler.unscale_(optimizer)
@@ -54,8 +103,6 @@ def train_one_epoch(model, loader, optimizer, scaler, device, criterion, cfg):
             scaler.step(optimizer)
             scaler.update()
         else:
-            logits = model(images)
-            loss = criterion(logits, targets)
             loss.backward()
             if grad_clip > 0:
                 torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
@@ -210,7 +257,7 @@ def run_training(
     class_names: Sequence[str],
     neptune_run=None,
 ):
-    scaler = GradScaler(enabled=bool(cfg["train"].get("amp", True)))
+    scaler = create_grad_scaler(device, enabled=bool(cfg["train"].get("amp", True)))
     epochs = int(cfg["train"]["epochs"])
     scheduler = build_schedulers(optimizer, steps_per_epoch=len(loaders["train"]), cfg=cfg)
     history = []
@@ -250,9 +297,10 @@ def run_training(
             f"train_loss={tr['loss']:.4f} val_loss={va['loss']:.4f} val_f1={va['f1_weighted']:.4f}"
         )
 
-        current_metric = va.get(monitor)
-        if current_metric is None:
-            raise ValueError(f"Validation metrics do not contain monitor key '{monitor}'")
+        try:
+            current_metric = _resolve_monitor_value(va, monitor)
+        except KeyError as err:
+            raise ValueError(str(err)) from err
         improved = (current_metric > best_metric) if mode == "max" else (current_metric < best_metric)
         if improved:
             best_metric = current_metric
