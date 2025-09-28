@@ -19,11 +19,22 @@ model:
   name: "vit_large_patch16_448"
   pretrained: true
   drop_path_rate: 0.1
+  models_dir: "./model_cache"
 loss:
   type: "cross_entropy"
   class_weighting: "inv_freq"
   focal_gamma: 2.0
+checkpoint:
+  dir: "./runs/vit_large/checkpoints"
+  save_every_epochs: 5
+  monitor: "val_acc1"
+  mode: "max"
+neptune:
+  enabled: false
+  project: ""
+  api_token: ""
+  tags: []
+  name: null
 out:
   output_dir: "./runs/vit_large"
-  save_every: 5
   seed: 42
