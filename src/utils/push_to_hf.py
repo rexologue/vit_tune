@@ -8,12 +8,16 @@ training pipeline (``labels.json`` and a checkpoint containing the model
 
 from __future__ import annotations
 
+import os
+import sys
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+print(sys.path)
+
 import argparse
 import json
-import os
 from pathlib import Path
 import shutil
-import sys
 import textwrap
 import tempfile
 from typing import Dict, List, Tuple
@@ -21,7 +25,7 @@ from typing import Dict, List, Tuple
 import torch
 from huggingface_hub import HfApi
 
-from src.models.build import build_model
+from models.build import build_model
 
 
 def _load_labels(labels_path: Path) -> Tuple[List[str], Dict[str, int]]:
